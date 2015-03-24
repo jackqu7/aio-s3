@@ -54,7 +54,8 @@ class Key(object):
 
 
 class Request(object):
-    def __init__(self, verb, resource, query, headers, payload):
+    def __init__(self, verb, resource, query, headers, payload,
+                 encryption_key=None):
         self.verb = verb
         self.resource = amz_uriencode_slash(resource)
         self.params = query
@@ -65,9 +66,20 @@ class Request(object):
         self.payload = payload
         self.content_md5 = ''
 
+        if encryption_key is not None:
+            self.headers['x-amz-server-side-encryption-customer-algorithm'] = \
+                'AES256'
+            key_b64 = base64.encodestring(encryption_key).strip()
+            self.headers['x-amz-server-side-encryption-customer-key'] = \
+                key_b64.decode('utf-8')
+            key_md5 = hashlib.md5(encryption_key).digest()
+            key_md5_b64 = base64.b64encode(key_md5)
+            self.headers['x-amz-server-side-encryption-customer-key-MD5'] = \
+                key_md5_b64.decode('utf-8')
+
     @property
     def url(self):
-        return 'http://{0.headers[HOST]}{0.resource}?{0.query_string}' \
+        return 'https://{0.headers[HOST]}{0.resource}?{0.query_string}' \
             .format(self)
 
 
@@ -122,9 +134,9 @@ def sign_v4(req, *,
         date=date,
         region=aws_region,
         service=aws_service,
-        reqhash=hashlib.sha256(creq.encode('ascii')).hexdigest(),
+        reqhash=hashlib.sha256(creq.encode('utf-8')).hexdigest(),
         ))
-    sig = hmac.new(signing_key, string_to_sign.encode('ascii'),
+    sig = hmac.new(signing_key, string_to_sign.encode('utf-8'),
         hashlib.sha256).hexdigest()
 
     ahdr = ('AWS4-HMAC-SHA256 '
@@ -206,7 +218,7 @@ class MultipartUpload(object):
                 'HOST': self.bucket._host,
                 # next one aiohttp adds for us anyway, so we must put it here
                 # so it's added into signature
-                'CONTENT-TYPE': 'application/octed-stream',
+                'CONTENT-TYPE': 'application/octet-stream',
             }, payload=data))
         try:
             if result.status != 200:
@@ -353,11 +365,11 @@ class Bucket(object):
             yield read_next()
 
     @asyncio.coroutine
-    def download(self, key):
+    def download(self, key, encryption_key=None):
         if isinstance(key, Key):
             key = key.key
         result = yield from self._request(Request(
-            "GET", '/' + key, {}, {'HOST': self._host}, b''))
+            "GET", '/' + key, {}, {'HOST': self._host}, b'', encryption_key))
         if result.status != 200:
             raise errors.AWSException.from_bytes(
                 result.status, (yield from result.read()))
@@ -366,7 +378,8 @@ class Bucket(object):
     @asyncio.coroutine
     def upload(self, key, data,
             content_length=None,
-            content_type='application/octed-stream'):
+            content_type='application/octet-stream',
+            encryption_key=None):
         """Upload file to S3
 
         The `data` might be a generator or stream.
@@ -387,8 +400,9 @@ class Bucket(object):
             }
         if content_length is not None:
             headers['CONTENT-LENGTH'] = str(content_length)
+
         result = yield from self._request(Request("PUT", '/' + key, {},
-            headers=headers, payload=data))
+            headers=headers, payload=data, encryption_key=encryption_key))
         try:
             if result.status != 200:
                 xml = yield from result.read()
@@ -398,11 +412,11 @@ class Bucket(object):
             result.close()
 
     @asyncio.coroutine
-    def delete(self, key):
+    def delete(self, key, encryption_key=None):
         if isinstance(key, Key):
             key = key.key
         result = yield from self._request(Request("DELETE", '/' + key, {},
-            {'HOST': self._host}, b''))
+            {'HOST': self._host}, b'', encryption_key))
         try:
             if result.status != 204:
                 xml = yield from result.read()
@@ -412,11 +426,11 @@ class Bucket(object):
             result.close()
 
     @asyncio.coroutine
-    def get(self, key):
+    def get(self, key, encryption_key=None):
         if isinstance(key, Key):
             key = key.key
         result = yield from self._request(Request(
-            "GET", '/' + key, {}, {'HOST': self._host}, b''))
+            "GET", '/' + key, {}, {'HOST': self._host}, b'', encryption_key))
         if result.status != 200:
             raise errors.AWSException.from_bytes(
                 result.status, (yield from result.read()))
@@ -436,8 +450,9 @@ class Bucket(object):
 
     @asyncio.coroutine
     def upload_multipart(self, key,
-            content_type='application/octed-stream',
-            MultipartUpload=MultipartUpload):
+            content_type='application/octet-stream',
+            MultipartUpload=MultipartUpload,
+            encryption_key=None):
         """Upload file to S3 by uploading multiple chunks"""
 
         if isinstance(key, Key):
@@ -446,7 +461,7 @@ class Bucket(object):
             '/' + key, {'uploads': ''}, {
             'HOST': self._host,
             'CONTENT-TYPE': content_type,
-            }, payload=b''))
+            }, payload=b'', encryption_key=encryption_key))
         try:
             if result.status != 200:
                 xml = yield from result.read()
