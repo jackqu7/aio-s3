@@ -199,8 +199,7 @@ class MultipartUpload(object):
         self._done = False
         self._uri = '/' + self.key + '?uploadId=' + self.upload_id
 
-    @asyncio.coroutine
-    def add_chunk(self, data):
+    async def add_chunk(self, data):
         assert isinstance(data, (bytes, memoryview, bytearray)), data
 
         # figure out how to check chunk size, all but last one
@@ -209,7 +208,7 @@ class MultipartUpload(object):
         if self._done:
             raise RuntimeError("Can't add_chunk after commit or close")
         self.parts += 1
-        result = yield from self.bucket._request(Request("PUT",
+        result = await self.bucket._request(Request("PUT",
             '/' + self.key, {
                 'uploadId': self.upload_id,
                 'partNumber': str(self.parts),
@@ -222,7 +221,7 @@ class MultipartUpload(object):
             }, payload=data))
         try:
             if result.status != 200:
-                xml = yield from result.read()
+                xml = await result.read()
                 raise errors.AWSException.from_bytes(result.status, xml)
             etag = result.headers['ETAG']
         finally:
@@ -231,13 +230,12 @@ class MultipartUpload(object):
         SubElement(chunk, 'PartNumber').text = str(self.parts)
         SubElement(chunk, 'ETag').text = etag
 
-    @asyncio.coroutine
-    def commit(self):
+    async def commit(self):
         if self._done:
             raise RuntimeError("Can't commit twice or after close")
         self._done = True
         data = xml_tostring(self.xml)
-        result = yield from self.bucket._request(Request("POST",
+        result = await self.bucket._request(Request("POST",
             '/' + self.key, {
                 'uploadId': self.upload_id,
             }, headers={
@@ -246,7 +244,7 @@ class MultipartUpload(object):
                 'CONTENT-TYPE': 'application/xml',
             }, payload=data))
         try:
-            xml = yield from result.read()
+            xml = await result.read()
             if result.status != 200:
                 raise errors.AWSException.from_bytes(result.status, xml)
             xml = parse_xml(xml)
@@ -254,17 +252,16 @@ class MultipartUpload(object):
         finally:
             result.close()
 
-    @asyncio.coroutine
-    def close(self):
+    async def close(self):
         if self._done:
             return
         self._done = True
-        result = yield from self.bucket._request(Request("DELETE",
+        result = await self.bucket._request(Request("DELETE",
             '/' + self.key, {
                 'uploadId': self.upload_id,
             }, headers={'HOST': self.bucket._host}, payload=b''))
         try:
-            xml = yield from result.read()
+            xml = await result.read()
             if result.status != 204:
                 raise errors.AWSException.from_bytes(result.status, xml)
         finally:
@@ -294,9 +291,8 @@ class Bucket(object):
             self._host = self._host + ':' + str(port)
         self._signature = signature
 
-    @asyncio.coroutine
-    def exists(self, prefix=''):
-        result = yield from self._request(Request(
+    async def exists(self, prefix=''):
+        result = await self._request(Request(
             "GET",
             "/",
             {'prefix': prefix,
@@ -305,16 +301,15 @@ class Bucket(object):
             {'HOST': self._host},
             b'',
             ))
-        data = (yield from result.read())
+        data = (await result.read())
         if result.status != 200:
             raise errors.AWSException.from_bytes(result.status, data)
         x = parse_xml(data)
         return any(map(Key.from_xml,
                         x.findall('s3:Contents', namespaces=NS)))
 
-    @asyncio.coroutine
-    def list(self, prefix='', max_keys=1000):
-        result = yield from self._request(Request(
+    async def list(self, prefix='', max_keys=1000):
+        result = await self._request(Request(
             "GET",
             "/",
             {'prefix': prefix,
@@ -322,7 +317,7 @@ class Bucket(object):
             {'HOST': self._host},
             b'',
             ))
-        data = (yield from result.read())
+        data = (await result.read())
         if result.status != 200:
             raise errors.AWSException.from_bytes(result.status, data)
         x = parse_xml(data)
@@ -336,10 +331,9 @@ class Bucket(object):
         final = False
         marker = ''
 
-        @asyncio.coroutine
-        def read_next():
+        async def read_next():
             nonlocal final, marker
-            result = yield from self._request(Request(
+            result = await self._request(Request(
                 "GET",
                 "/",
                 {'prefix': prefix,
@@ -348,7 +342,7 @@ class Bucket(object):
                 {'HOST': self._host},
                 b'',
                 ))
-            data = (yield from result.read())
+            data = (await result.read())
             if result.status != 200:
                 raise errors.AWSException.from_bytes(result.status, data)
             x = parse_xml(data)
@@ -364,19 +358,17 @@ class Bucket(object):
         while not final:
             yield read_next()
 
-    @asyncio.coroutine
-    def download(self, key, encryption_key=None):
+    async def download(self, key, encryption_key=None):
         if isinstance(key, Key):
             key = key.key
-        result = yield from self._request(Request(
+        result = await self._request(Request(
             "GET", '/' + key, {}, {'HOST': self._host}, b'', encryption_key))
         if result.status != 200:
             raise errors.AWSException.from_bytes(
-                result.status, (yield from result.read()))
+                result.status, (await result.read()))
         return result
 
-    @asyncio.coroutine
-    def upload(self, key, data,
+    async def upload(self, key, data,
             content_length=None,
             content_type='application/octet-stream',
             encryption_key=None):
@@ -401,55 +393,63 @@ class Bucket(object):
         if content_length is not None:
             headers['CONTENT-LENGTH'] = str(content_length)
 
-        result = yield from self._request(Request("PUT", '/' + key, {},
-            headers=headers, payload=data, encryption_key=encryption_key))
-        try:
-            if result.status != 200:
-                xml = yield from result.read()
-                raise errors.AWSException.from_bytes(result.status, xml)
-            return result
-        finally:
-            result.close()
+        req = Request(
+            "PUT", '/' + key, {},
+            headers=headers,
+            payload=data,
+            encryption_key=encryption_key
+        )
+        params = self.get_request_params(req)
 
-    @asyncio.coroutine
-    def delete(self, key, encryption_key=None):
+        async with aiohttp.ClientSession() as client:
+            async with client.put(req.url, **params) as result:
+
+                try:
+                    if result.status != 200:
+                        xml = await result.read()
+                        raise errors.AWSException.from_bytes(result.status, xml)
+                    return result
+                finally:
+                    result.close()
+
+    async def delete(self, key, encryption_key=None):
         if isinstance(key, Key):
             key = key.key
-        result = yield from self._request(Request("DELETE", '/' + key, {},
+        result = await self._request(Request("DELETE", '/' + key, {},
             {'HOST': self._host}, b'', encryption_key))
         try:
             if result.status != 204:
-                xml = yield from result.read()
+                xml = await result.read()
                 raise errors.AWSException.from_bytes(result.status, xml)
             return result
         finally:
             result.close()
 
-    @asyncio.coroutine
-    def get(self, key, encryption_key=None):
+    async def get(self, key, encryption_key=None):
         if isinstance(key, Key):
             key = key.key
-        result = yield from self._request(Request(
+        result = await self._request(Request(
             "GET", '/' + key, {}, {'HOST': self._host}, b'', encryption_key))
         if result.status != 200:
             raise errors.AWSException.from_bytes(
-                result.status, (yield from result.read()))
-        data = yield from result.read()
+                result.status, (await result.read()))
+        data = await result.read()
         return data
 
-    @asyncio.coroutine
-    def _request(self, req):
+    def get_request_params(self, req):
         _SIGNATURES[self._signature](req, **self._aws_sign_data)
         if isinstance(req.payload, bytes):
             req.headers['CONTENT-LENGTH'] = str(len(req.payload))
-        return (yield from aiohttp.request(req.verb, req.url,
-            chunked='CONTENT-LENGTH' not in req.headers,
-            headers=req.headers,
-            data=req.payload,
-            connector=self._connector))
 
-    @asyncio.coroutine
-    def upload_multipart(self, key,
+        params = {
+         "chunked": 'CONTENT-LENGTH' not in req.headers,
+         "headers": req.headers,
+         "data": req.payload,
+         "params": req.params
+        }
+        return params
+
+    async def upload_multipart(self, key,
             content_type='application/octet-stream',
             MultipartUpload=MultipartUpload,
             encryption_key=None):
@@ -457,16 +457,16 @@ class Bucket(object):
 
         if isinstance(key, Key):
             key = key.key
-        result = yield from self._request(Request("POST",
+        result = await self._request(Request("POST",
             '/' + key, {'uploads': ''}, {
             'HOST': self._host,
             'CONTENT-TYPE': content_type,
             }, payload=b'', encryption_key=encryption_key))
         try:
             if result.status != 200:
-                xml = yield from result.read()
+                xml = await result.read()
                 raise errors.AWSException.from_bytes(result.status, xml)
-            xml = yield from result.read()
+            xml = await result.read()
             upload_id = parse_xml(xml).find('s3:UploadId',
                                             namespaces=NS).text
             assert upload_id, xml
